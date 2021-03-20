@@ -8,6 +8,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include "ge1/shader_module.h"
+
 using namespace std;
 
 extern char _binary_shaders_triangle_vertex_glsl_spv_start;
@@ -412,48 +414,15 @@ int main() {
     };
 
     // load shaders
-    VkShaderModule vertexShaderModule, fragmentShaderModule;
-    {
-        // TODO: make function
-        VkShaderModuleCreateInfo createInfo{
-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .codeSize = static_cast<size_t>(
-                &_binary_shaders_triangle_vertex_glsl_spv_end -
-                &_binary_shaders_triangle_vertex_glsl_spv_start
-            ),
-            .pCode = reinterpret_cast<const uint32_t*>(
-                &_binary_shaders_triangle_vertex_glsl_spv_start
-            ),
-        };
-        if (
-            vkCreateShaderModule(
-                device, &createInfo, nullptr, &vertexShaderModule
-            ) !=
-            VK_SUCCESS
-        ) {
-            throw runtime_error("failed to create shader module");
-        }
-    }
-    {
-        VkShaderModuleCreateInfo createInfo{
-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .codeSize = static_cast<size_t>(
-                &_binary_shaders_black_fragment_glsl_spv_end -
-                &_binary_shaders_black_fragment_glsl_spv_start
-            ),
-            .pCode = reinterpret_cast<const uint32_t*>(
-                &_binary_shaders_black_fragment_glsl_spv_start
-            ),
-        };
-        if (
-            vkCreateShaderModule(
-                device, &createInfo, nullptr, &fragmentShaderModule
-            ) !=
-            VK_SUCCESS
-        ) {
-            throw runtime_error("failed to create shader module");
-        }
-    }
+    VkShaderModule
+        vertexShaderModule = ge1::create_shader_module(device, {
+            &_binary_shaders_triangle_vertex_glsl_spv_start,
+            &_binary_shaders_triangle_vertex_glsl_spv_end
+        }),
+        fragmentShaderModule = ge1::create_shader_module(device, {
+            &_binary_shaders_black_fragment_glsl_spv_start,
+            &_binary_shaders_black_fragment_glsl_spv_end
+        });
 
     // create pipeline
     VkPipelineLayout pipelineLayout;

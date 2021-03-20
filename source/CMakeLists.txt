@@ -2,7 +2,11 @@ cmake_minimum_required(VERSION 3.5)
 
 find_program(GLSLC glslc)
 
+add_subdirectory(game_engine1)
+
 add_executable(vulkan main.cpp)
+
+target_link_libraries(vulkan game_engine1_vulkan)
 
 
 function(add_shader TARGET SHADER)
