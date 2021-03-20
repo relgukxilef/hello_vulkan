@@ -24,9 +24,9 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
         //throw runtime_error("vulkan error");
         // can't throw because Nsight causes errors I don't care about
-        cerr << "validation layer: error: " << callbackData->pMessage << endl;
-    } else {
-        cout << "validation layer: info: " << callbackData->pMessage << endl;
+        cerr << "validation layer error: " << callbackData->pMessage << endl;
+    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        cout << "validation layer warning: " << callbackData->pMessage << endl;
     }
 
     return VK_FALSE;
@@ -93,11 +93,14 @@ int main() {
         glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
     // loop up supported extensions
-    uint32_t extensionCount = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
-    auto extensions = make_unique<VkExtensionProperties[]>(extensionCount);
+    uint32_t supportedExtensionCount = 0;
     vkEnumerateInstanceExtensionProperties(
-        nullptr, &extensionCount, extensions.get()
+        nullptr, &supportedExtensionCount, nullptr
+    );
+    auto supportedExtensions =
+        make_unique<VkExtensionProperties[]>(supportedExtensionCount);
+    vkEnumerateInstanceExtensionProperties(
+        nullptr, &supportedExtensionCount, supportedExtensions.get()
     );
 
     // check support for layers
@@ -123,6 +126,18 @@ int main() {
     }
 
     // create instance
+    const char *requiredExtensions[]{
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+    };
+    auto extensionCount = size(requiredExtensions) + glfwExtensionCount;
+    auto extensions = make_unique<const char*[]>(extensionCount);
+    std::copy(
+        glfwExtensions, glfwExtensions + glfwExtensionCount, extensions.get()
+    );
+    std::copy(
+        requiredExtensions, requiredExtensions + size(requiredExtensions),
+        extensions.get() + glfwExtensionCount
+    );
     VkInstance instance;
     {
         VkInstanceCreateInfo createInfo{
@@ -131,11 +146,43 @@ int main() {
             .pApplicationInfo = &applicationInfo,
             .enabledLayerCount = size(enabledLayers),
             .ppEnabledLayerNames = enabledLayers,
-            .enabledExtensionCount = glfwExtensionCount,
-            .ppEnabledExtensionNames = glfwExtensions,
+            .enabledExtensionCount = static_cast<uint32_t>(extensionCount),
+            .ppEnabledExtensionNames = extensions.get(),
         };
         if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
             throw runtime_error("failed to create instance");
+        }
+    }
+
+    // create debug utils messenger
+    auto vkCreateDebugUtilsMessengerEXT =
+        (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            instance, "vkCreateDebugUtilsMessengerEXT"
+    );
+    auto vkDestroyDebugUtilsMessengerEXT =
+        (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            instance, "vkDestroyDebugUtilsMessengerEXT"
+    );
+    VkDebugUtilsMessengerEXT debugUtilsMessenger;
+    {
+        VkDebugUtilsMessengerCreateInfoEXT createInfo{
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity =
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType =
+                VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = debugCallback,
+        };
+        if (
+            vkCreateDebugUtilsMessengerEXT(
+                instance, &createInfo, nullptr, &debugUtilsMessenger
+            ) != VK_SUCCESS
+        ) {
+            throw runtime_error("failed to create debug utils messenger");
         }
     }
 
@@ -653,6 +700,7 @@ int main() {
     }
 
     // create semaphores
+    // TODO: make semaphores per swapchain image
     VkSemaphore imageAvailableSemaphor, renderFinishedSemaphor;
     {
         VkSemaphoreCreateInfo createInfo{
@@ -744,6 +792,7 @@ int main() {
 
     vkDestroySurfaceKHR(instance, surface, nullptr);
     vkDestroyDevice(device, nullptr);
+    vkDestroyDebugUtilsMessengerEXT(instance, debugUtilsMessenger, nullptr);
     vkDestroyInstance(instance, nullptr);
 
     glfwDestroyWindow(window);
