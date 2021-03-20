@@ -1,8 +1,10 @@
 #version 450
 #pragma shader_stage(fragment)
 
-layout(location = 0) out vec4 outColor;
+layout(location = 0) in vec3 vertex_color;
+
+layout(location = 0) out vec4 color;
 
 void main() {
-    outColor = vec4(vec3(0.0), 1.0);
+    color = vec4(pow(vertex_color, vec3(1.0 / 2.2)), 1.0);
 }
