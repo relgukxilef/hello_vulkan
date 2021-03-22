@@ -72,6 +72,8 @@ struct frame {
 
 struct display_size {
     // TODO: find better name
+    VkSurfaceCapabilitiesKHR capabilities;
+    ge1::unique_span<swapchain_frame> swapchain_frames;
     VkExtent2D extent;
     VkSwapchainKHR swapchain;
     VkViewport viewport;
@@ -82,30 +84,39 @@ struct display_size {
 };
 
 void create_display_size(
-    GLFWwindow* window, VkDevice device,
-    VkSurfaceCapabilitiesKHR capabilities,
+    int framebuffer_width, int framebuffer_height,
+    VkDevice device,
+    VkPhysicalDevice physical_device,
     uint32_t graphics_queue_family, uint32_t present_queue_family,
     VkSurfaceKHR surface, VkSurfaceFormatKHR surface_format,
-    ge1::span<swapchain_frame> swapchain_frames,
     VkShaderModule vertex_shader_module, VkShaderModule fragment_shader_module,
     VkCommandPool command_pool,
     display_size& display_size
 ) {
+    // NOTE: capabilities change with window size
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+        physical_device, surface, &display_size.capabilities
+    );
+
+    display_size.swapchain_frames = ge1::unique_span<swapchain_frame>(
+        display_size.capabilities.minImageCount
+    );
+
     auto present_mode = VK_PRESENT_MODE_FIFO_KHR;
-    int framebuffer_width, framebuffer_height;
-    glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
     display_size.extent = {
         max(
             min<uint32_t>(
-                framebuffer_width, capabilities.maxImageExtent.width
+                framebuffer_width,
+                display_size.capabilities.maxImageExtent.width
             ),
-            capabilities.minImageExtent.width
+            display_size.capabilities.minImageExtent.width
         ),
         max(
             min<uint32_t>(
-                framebuffer_height, capabilities.maxImageExtent.height
+                framebuffer_height,
+                display_size.capabilities.maxImageExtent.height
             ),
-            capabilities.maxImageExtent.height
+            display_size.capabilities.minImageExtent.height
         )
     };
 
@@ -116,7 +127,7 @@ void create_display_size(
         VkSwapchainCreateInfoKHR create_info{
             .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .surface = surface,
-            .minImageCount = swapchain_frames.size(),
+            .minImageCount = display_size.swapchain_frames.size(),
             .imageFormat = surface_format.format,
             .imageColorSpace = surface_format.colorSpace,
             .imageExtent = display_size.extent,
@@ -125,7 +136,7 @@ void create_display_size(
             .imageSharingMode = VK_SHARING_MODE_CONCURRENT,
             .queueFamilyIndexCount = size(queue_family_indices),
             .pQueueFamilyIndices = queue_family_indices,
-            .preTransform = capabilities.currentTransform,
+            .preTransform = display_size.capabilities.currentTransform,
             .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
             .presentMode = present_mode,
             .clipped = VK_TRUE,
@@ -306,18 +317,18 @@ void create_display_size(
             device, display_size.swapchain, &image_count, nullptr
         );
         // TODO: create swapchain after actual image count is known
-        assert(image_count == swapchain_frames.size());
+        assert(image_count == display_size.swapchain_frames.size());
 
         // command buffers
         auto commandBuffers = make_unique<VkCommandBuffer[]>(
-            swapchain_frames.size()
+            display_size.swapchain_frames.size()
         );
         {
             VkCommandBufferAllocateInfo allocate_info{
                 .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                 .commandPool = command_pool,
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                .commandBufferCount = swapchain_frames.size(),
+                .commandBufferCount = display_size.swapchain_frames.size(),
             };
             if (
                 vkAllocateCommandBuffers(
@@ -328,12 +339,12 @@ void create_display_size(
             }
         }
 
-        ge1::unique_span<VkImage> images(swapchain_frames.size());
+        ge1::unique_span<VkImage> images(display_size.swapchain_frames.size());
         vkGetSwapchainImagesKHR(
             device, display_size.swapchain, &image_count, images.begin()
         );
-        for (auto i = 0u; i < swapchain_frames.size(); i++) {
-            auto& swapchain_frame = swapchain_frames[i];
+        for (auto i = 0u; i < display_size.swapchain_frames.size(); i++) {
+            auto& swapchain_frame = display_size.swapchain_frames[i];
             swapchain_frame.image = images[i];
             swapchain_frame.command_buffer = commandBuffers[i];
 
@@ -425,10 +436,10 @@ void create_display_size(
 }
 
 void destroy_display_size(
-    VkDevice device, ge1::span<swapchain_frame> swapchain_frames,
+    VkDevice device,
     const display_size& display_size
 ) {
-    for (auto& swapchain_frame : swapchain_frames) {
+    for (auto& swapchain_frame : display_size.swapchain_frames) {
         vkDestroyFramebuffer(device, swapchain_frame.framebuffer, nullptr);
     }
 
@@ -436,7 +447,7 @@ void destroy_display_size(
     vkDestroyPipelineLayout(device, display_size.pipeline_layout, nullptr);
     vkDestroyRenderPass(device, display_size.render_pass, nullptr);
 
-    for (auto& swapchain_frame : swapchain_frames) {
+    for (auto& swapchain_frame : display_size.swapchain_frames) {
         vkDestroyImageView(device, swapchain_frame.view, nullptr);
     }
 
@@ -449,7 +460,7 @@ int main() {
     unsigned windowWidth = 1280, windowHeight = 720;
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     GLFWwindow* window =
         glfwCreateWindow(windowWidth, windowHeight, "Vulkan", nullptr, nullptr);
 
@@ -676,11 +687,6 @@ int main() {
     vkGetDeviceQueue(device, presentQueueFamily, 0, &presentQueue);
 
     // create swap chains
-    VkSurfaceCapabilitiesKHR capabilities;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
-        physicalDevice, surface, &capabilities
-    );
-
     uint32_t formatCount = 0, presentModeCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(
         physicalDevice, surface, &formatCount, nullptr
@@ -742,14 +748,14 @@ int main() {
     }
 
     // create swapchain
-    ge1::unique_span<swapchain_frame> swapchain_frames(
-        capabilities.minImageCount
-    );
     display_size display_size;
+
+    int framebuffer_width, framebuffer_height;
+    glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
     create_display_size(
-        window, device, capabilities,
+        framebuffer_width, framebuffer_width, device, physicalDevice,
         graphicsQueueFamily, presentQueueFamily, surface, surfaceFormat,
-        swapchain_frames, vertexShaderModule, fragmentShaderModule,
+        vertexShaderModule, fragmentShaderModule,
         commandPool,
         display_size
     );
@@ -797,50 +803,77 @@ int main() {
 
         // get next image from swapchain
         uint32_t image_index;
-        vkAcquireNextImageKHR(
-            device, display_size.swapchain, -1ul, frame.image_available_semaphore,
+        auto result = vkAcquireNextImageKHR(
+            device, display_size.swapchain, -1ul,
+            frame.image_available_semaphore,
             VK_NULL_HANDLE,
             &image_index
         );
-        auto& swapchain_frame = swapchain_frames[image_index];
+        if (result == VK_SUCCESS) {
+            auto& swapchain_frame = display_size.swapchain_frames[image_index];
 
-        // submit command buffer
-        VkSemaphore waitSemaphores[]{frame.image_available_semaphore};
-        VkPipelineStageFlags waitStages[]{
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-        };
-        VkSemaphore signalSemaphores[]{
-            frame.render_finished_semaphore
-        };
-        VkSubmitInfo submitInfo{
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .waitSemaphoreCount = 1,
-            .pWaitSemaphores = waitSemaphores,
-            .pWaitDstStageMask = waitStages,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &swapchain_frame.command_buffer,
-            .signalSemaphoreCount = 1,
-            .pSignalSemaphores = signalSemaphores,
-        };
-        if (
-            vkQueueSubmit(graphicsQueue, 1, &submitInfo, frame.ready_fence) !=
-            VK_SUCCESS
+            // submit command buffer
+            VkSemaphore waitSemaphores[]{frame.image_available_semaphore};
+            VkPipelineStageFlags waitStages[]{
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+            };
+            VkSemaphore signalSemaphores[]{
+                frame.render_finished_semaphore
+            };
+            VkSubmitInfo submitInfo{
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .waitSemaphoreCount = 1,
+                .pWaitSemaphores = waitSemaphores,
+                .pWaitDstStageMask = waitStages,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &swapchain_frame.command_buffer,
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = signalSemaphores,
+            };
+            if (
+                vkQueueSubmit(graphicsQueue, 1, &submitInfo, frame.ready_fence) !=
+                VK_SUCCESS
+            ) {
+                throw runtime_error("failed to submit draw command buffer");
+            }
+
+            // present image
+            VkPresentInfoKHR presentInfo{
+                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                .waitSemaphoreCount = 1,
+                .pWaitSemaphores = signalSemaphores,
+                .swapchainCount = 1,
+                .pSwapchains = &display_size.swapchain,
+                .pImageIndices = &image_index,
+            };
+            vkQueuePresentKHR(presentQueue, &presentInfo);
+
+            frame_index = (frame_index + 1) % frames.size();
+
+        } else if (
+            result == VK_SUBOPTIMAL_KHR || result == VK_ERROR_OUT_OF_DATE_KHR
         ) {
-            throw runtime_error("failed to submit draw command buffer");
+            int framebuffer_width, framebuffer_height;
+            glfwGetFramebufferSize(
+                window, &framebuffer_width, &framebuffer_height
+            );
+            if (framebuffer_height > 0 && framebuffer_width > 0) {
+                destroy_display_size(device, display_size);
+
+                create_display_size(
+                    framebuffer_width, framebuffer_width,
+                    device, physicalDevice,
+                    graphicsQueueFamily, presentQueueFamily,
+                    surface, surfaceFormat,
+                    vertexShaderModule, fragmentShaderModule,
+                    commandPool,
+                    display_size
+                );
+            }
+
+        } else {
+            throw runtime_error("failed to acquire sawp chain image");
         }
-
-        // present image
-        VkPresentInfoKHR presentInfo{
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .waitSemaphoreCount = 1,
-            .pWaitSemaphores = signalSemaphores,
-            .swapchainCount = 1,
-            .pSwapchains = &display_size.swapchain,
-            .pImageIndices = &image_index,
-        };
-        vkQueuePresentKHR(presentQueue, &presentInfo);
-
-        frame_index = (frame_index + 1) % frames.size();
 
         // TODO: swapchain doesn't necessarily sync with current monitor
         // use VK_KHR_display to wait for vsync of current display
@@ -854,7 +887,7 @@ int main() {
         vkDestroyFence(device, frame.ready_fence, nullptr);
     }
 
-    destroy_display_size(device, swapchain_frames, display_size);
+    destroy_display_size(device, display_size);
 
     vkDestroyCommandPool(device, commandPool, nullptr);
 
