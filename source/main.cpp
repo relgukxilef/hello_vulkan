@@ -6,9 +6,11 @@
 #include <fstream>
 
 #define GLFW_INCLUDE_VULKAN
+#define GLFW_VULKAN_STATIC
 #include <GLFW/glfw3.h>
 
 #include "ge1/shader_module.h"
+#include "ge1/span.h"
 
 using namespace std;
 
@@ -54,6 +56,18 @@ unique_range<char> read_file(const char* filename) {
 
     return {std::move(data), data.get() + size};
 }
+
+struct swapchain_frame {
+    VkImage image;
+    VkImageView view;
+    VkFramebuffer framebuffer;
+    VkCommandBuffer command_buffer;
+};
+
+struct frame {
+    VkSemaphore image_available_semaphore, render_finished_semaphore;
+    VkFence ready_fence;
+};
 
 int main() {
     glfwInit();
@@ -345,7 +359,7 @@ int main() {
         )
     };
 
-    uint32_t imageCount = capabilities.minImageCount + 1;
+    uint32_t imageCount = capabilities.minImageCount;
     VkSwapchainKHR swapchain;
     {
         uint32_t queueFamilyIndices[]{
@@ -370,33 +384,6 @@ int main() {
             .oldSwapchain = VK_NULL_HANDLE,
         };
         vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapchain);
-    }
-
-    // get swapchain images and views
-    vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr);
-    auto images = make_unique<VkImage[]>(imageCount);
-    vkGetSwapchainImagesKHR(device, swapchain, &imageCount, images.get());
-
-    auto views = make_unique<VkImageView[]>(imageCount);
-    for (auto i = 0u; i < imageCount; i++) {
-        VkImageViewCreateInfo createInfo{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = images[i],
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = surfaceFormat.format,
-            .components{
-                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY
-            },
-            .subresourceRange{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            }
-        };
-        vkCreateImageView(device, &createInfo, nullptr, &views[i]);
     }
 
     // viewport
@@ -429,7 +416,6 @@ int main() {
     VkRenderPass renderPass;
     VkPipeline pipeline;
     {
-        // TODO: make function
         VkPipelineShaderStageCreateInfo stageCreateInfos[]{
             {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -575,29 +561,6 @@ int main() {
         }
     }
 
-    // create framebuffer
-    auto framebuffers = make_unique<VkFramebuffer[]>(imageCount);
-    for (auto i = 0u; i < imageCount; i++) {
-        VkImageView attachment = views[i];
-
-        VkFramebufferCreateInfo createInfo{
-            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .renderPass = renderPass,
-            .attachmentCount = 1,
-            .pAttachments = &attachment,
-            .width = extent.width,
-            .height = extent.height,
-            .layers = 1,
-        };
-
-        if (
-            vkCreateFramebuffer(device, &createInfo, nullptr, &framebuffers[i])
-            != VK_SUCCESS
-        ) {
-            throw runtime_error("failed to create framebuffer");
-        }
-    }
-
     // create command pool
     VkCommandPool commandPool;
     {
@@ -613,110 +576,191 @@ int main() {
         }
     }
 
-    // create command buffers
-    auto commandBuffers = make_unique<VkCommandBuffer[]>(imageCount);
+    // create swapchain frame data
+    ge1::unique_span<swapchain_frame> swapchain_frames(imageCount);
+    vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr);
     {
-        VkCommandBufferAllocateInfo allocateInfo{
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool = commandPool,
-            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = imageCount,
-        };
-        if (
-            vkAllocateCommandBuffers(
-                device, &allocateInfo, commandBuffers.get()
-            ) != VK_SUCCESS
-        ) {
-            throw runtime_error("failed to allocate command buffers");
+        // command buffers
+        auto commandBuffers = make_unique<VkCommandBuffer[]>(imageCount);
+        {
+            VkCommandBufferAllocateInfo allocateInfo{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .commandPool = commandPool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = imageCount,
+            };
+            if (
+                vkAllocateCommandBuffers(
+                    device, &allocateInfo, commandBuffers.get()
+                ) != VK_SUCCESS
+            ) {
+                throw runtime_error("failed to allocate command buffers");
+            }
+        }
+
+        ge1::unique_span<VkImage> images(imageCount);
+        vkGetSwapchainImagesKHR(device, swapchain, &imageCount, images.begin());
+        for (auto i = 0u; i < swapchain_frames.size(); i++) {
+            auto& swapchain_frame = swapchain_frames[i];
+            swapchain_frame.image = images[i];
+            swapchain_frame.command_buffer = commandBuffers[i];
+
+            // views
+            {
+                VkImageViewCreateInfo createInfo{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                    .image = swapchain_frame.image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = surfaceFormat.format,
+                    .subresourceRange{
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    }
+                };
+                vkCreateImageView(
+                    device, &createInfo, nullptr, &swapchain_frame.view
+                );
+            }
+
+            // framebuffers
+            VkImageView attachments[] = {swapchain_frame.view};
+            {
+                VkFramebufferCreateInfo createInfo{
+                    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                    .renderPass = renderPass,
+                    .attachmentCount = 1,
+                    .pAttachments = attachments,
+                    .width = extent.width,
+                    .height = extent.height,
+                    .layers = 1,
+                };
+
+                if (
+                    vkCreateFramebuffer(
+                        device, &createInfo, nullptr,
+                        &swapchain_frame.framebuffer
+                    ) != VK_SUCCESS
+                ) {
+                    throw runtime_error("failed to create framebuffer");
+                }
+            }
+
+            // write commands
+            VkCommandBufferBeginInfo bufferBeginInfo{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            };
+            if (
+                vkBeginCommandBuffer(
+                    swapchain_frame.command_buffer, &bufferBeginInfo
+                ) != VK_SUCCESS
+            ) {
+                throw runtime_error("failed to begin recording command buffer");
+            }
+            VkClearValue clearValue{{{1.0f, 1.0f, 1.0f, 1.0f}}};
+            VkRenderPassBeginInfo renderPassBeginInfo{
+                .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                .renderPass = renderPass,
+                .framebuffer = swapchain_frame.framebuffer,
+                .renderArea{
+                    .offset = {0, 0},
+                    .extent = extent,
+                },
+                .clearValueCount = 1,
+                .pClearValues = &clearValue,
+            };
+            vkCmdBeginRenderPass(
+                swapchain_frame.command_buffer, &renderPassBeginInfo,
+                VK_SUBPASS_CONTENTS_INLINE
+            );
+
+            vkCmdBindPipeline(
+                swapchain_frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline
+            );
+            vkCmdDraw(swapchain_frame.command_buffer, 3, 1, 0, 0);
+            vkCmdEndRenderPass(swapchain_frame.command_buffer);
+
+            if (
+                vkEndCommandBuffer(swapchain_frame.command_buffer) != VK_SUCCESS
+            ) {
+                throw runtime_error("failed to record command buffer");
+            }
         }
     }
 
-    for (auto i = 0u; i < imageCount; i++) {
-        VkCommandBufferBeginInfo bufferBeginInfo{
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        };
-        if (
-            vkBeginCommandBuffer(commandBuffers[i], &bufferBeginInfo) !=
-            VK_SUCCESS
-        ) {
-            throw runtime_error("failed to begin recording command buffer");
-        }
-        VkClearValue clearValue{{{1.0f, 1.0f, 1.0f, 1.0f}}};
-        VkRenderPassBeginInfo renderPassBeginInfo{
-            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-            .renderPass = renderPass,
-            .framebuffer = framebuffers[i],
-            .renderArea{
-                .offset = {0, 0},
-                .extent = extent,
-            },
-            .clearValueCount = 1,
-            .pClearValues = &clearValue,
-        };
-        vkCmdBeginRenderPass(
-            commandBuffers[i], &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE
-        );
+    // create frame data
+    unsigned frames_in_flight = 2;
+    ge1::unique_span<frame> frames(frames_in_flight);
+    for (auto i = 0u; i < frames.size(); i++) {
+        auto& frame = frames[i];
 
-        vkCmdBindPipeline(
-            commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline
-        );
-        vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
-        vkCmdEndRenderPass(commandBuffers[i]);
-
-        if (vkEndCommandBuffer(commandBuffers[i]) != VK_SUCCESS) {
-            throw runtime_error("failed to record command buffer");
-        }
-    }
-
-    // create semaphores
-    // TODO: make semaphores per swapchain image
-    VkSemaphore imageAvailableSemaphor, renderFinishedSemaphor;
-    {
-        VkSemaphoreCreateInfo createInfo{
+        // create semaphores
+        VkSemaphoreCreateInfo semaphore_create_info{
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         };
+        VkFenceCreateInfo fence_create_info{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        };
         if (
             vkCreateSemaphore(
-                device, &createInfo, nullptr, &imageAvailableSemaphor
+                device, &semaphore_create_info, nullptr,
+                &frame.image_available_semaphore
             ) != VK_SUCCESS ||
             vkCreateSemaphore(
-                device, &createInfo, nullptr, &renderFinishedSemaphor
-            ) != VK_SUCCESS
+                device, &semaphore_create_info, nullptr,
+                &frame.render_finished_semaphore
+            ) != VK_SUCCESS ||
+            vkCreateFence(
+                device, &fence_create_info, nullptr, &frame.ready_fence
+            )
         ) {
-            throw runtime_error("failed to create semaphores");
+            throw runtime_error("failed to create synchronisation objects");
         }
-
     }
 
+    unsigned frame_index = 0;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
+        auto& frame = frames[frame_index];
+
+        vkWaitForFences(device, 1, &frame.ready_fence, VK_TRUE, -1ul);
+        vkResetFences(device, 1, &frame.ready_fence);
+
         // get next image from swapchain
-        uint32_t imageIndex;
+        uint32_t image_index;
         vkAcquireNextImageKHR(
-            device, swapchain, -1u, imageAvailableSemaphor, VK_NULL_HANDLE,
-            &imageIndex
+            device, swapchain, -1ul, frame.image_available_semaphore,
+            VK_NULL_HANDLE,
+            &image_index
         );
+        auto& swapchain_frame = swapchain_frames[image_index];
 
         // submit command buffer
-        VkSemaphore waitSemaphores[]{imageAvailableSemaphor};
+        VkSemaphore waitSemaphores[]{frame.image_available_semaphore};
         VkPipelineStageFlags waitStages[]{
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
         };
-        VkSemaphore signalSemaphores[]{renderFinishedSemaphor};
+        VkSemaphore signalSemaphores[]{
+            frame.render_finished_semaphore
+        };
         VkSubmitInfo submitInfo{
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = waitSemaphores,
             .pWaitDstStageMask = waitStages,
             .commandBufferCount = 1,
-            .pCommandBuffers = &commandBuffers[imageIndex],
+            .pCommandBuffers = &swapchain_frame.command_buffer,
             .signalSemaphoreCount = 1,
             .pSignalSemaphores = signalSemaphores,
         };
         if (
-            vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) !=
+            vkQueueSubmit(graphicsQueue, 1, &submitInfo, frame.ready_fence) !=
             VK_SUCCESS
         ) {
             throw runtime_error("failed to submit draw command buffer");
@@ -729,22 +773,29 @@ int main() {
             .pWaitSemaphores = signalSemaphores,
             .swapchainCount = 1,
             .pSwapchains = &swapchain,
-            .pImageIndices = &imageIndex,
+            .pImageIndices = &image_index,
         };
         vkQueuePresentKHR(presentQueue, &presentInfo);
 
-        vkDeviceWaitIdle(device);
+        frame_index = (frame_index + 1) % frames.size();
+
+        // TODO: swapchain doesn't necessarily sync with current monitor
+        // use VK_KHR_display to wait for vsync of current display
     }
 
 
-    vkDestroySemaphore(device, imageAvailableSemaphor, nullptr);
-    vkDestroySemaphore(device, renderFinishedSemaphor, nullptr);
+    for (auto& frame : frames) {
+        vkWaitForFences(device, 1, &frame.ready_fence, VK_TRUE, -1ul);
+        vkDestroySemaphore(device, frame.image_available_semaphore, nullptr);
+        vkDestroySemaphore(device, frame.render_finished_semaphore, nullptr);
+        vkDestroyFence(device, frame.ready_fence, nullptr);
+    }
+
+    for (auto& swapchain_frame : swapchain_frames) {
+        vkDestroyFramebuffer(device, swapchain_frame.framebuffer, nullptr);
+    }
 
     vkDestroyCommandPool(device, commandPool, nullptr);
-
-    for (auto i = 0u; i < imageCount; i++) {
-        vkDestroyFramebuffer(device, framebuffers[i], nullptr);
-    }
 
     vkDestroyPipeline(device, pipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -754,7 +805,7 @@ int main() {
     vkDestroyShaderModule(device, fragmentShaderModule, nullptr);
 
     for (auto i = 0u; i < imageCount; i++) {
-        vkDestroyImageView(device, views[i], nullptr);
+        vkDestroyImageView(device, swapchain_frames[i].view, nullptr);
     }
 
     vkDestroySwapchainKHR(device, swapchain, nullptr);
