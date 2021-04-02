@@ -39,5 +39,5 @@ function(add_shader TARGET SHADER)
     )
 endfunction(add_shader)
 
-add_shader(vulkan shaders/triangle_vertex.glsl)
-add_shader(vulkan shaders/black_fragment.glsl)
+add_shader(vulkan shaders/solid_vertex.glsl)
+add_shader(vulkan shaders/solid_fragment.glsl)
