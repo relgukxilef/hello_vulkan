@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <fstream>
 #include <cassert>
+#include <array>
 
 #define GLFW_INCLUDE_VULKAN
 #define GLFW_VULKAN_STATIC
@@ -424,7 +425,7 @@ int main() {
     );
 
     // check support for layers
-    ge1::unique_span<const char* const> enabled_layers{
+    const char* enabled_layers[]{
         "VK_LAYER_KHRONOS_validation",
     };
 
@@ -432,10 +433,11 @@ int main() {
     vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
     auto layers = make_unique<VkLayerProperties[]>(layer_count);
     vkEnumerateInstanceLayerProperties(&layer_count, layers.get());
-    for (const auto& enabled_layer : enabled_layers) {
+    for (const char* enabled_layer : enabled_layers) {
         bool supported = false;
         for (auto i = 0u; i < layer_count; i++) {
-            if (strcmp(enabled_layer, layers[i].layerName) == 0) {
+            auto equal = strcmp(enabled_layer, layers[i].layerName);
+            if (equal == 0) {
                 supported = true;
                 break;
             }
@@ -465,8 +467,8 @@ int main() {
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pNext = &debugUtilsMessengerCreateInfo,
             .pApplicationInfo = &applicationInfo,
-            .enabledLayerCount = enabled_layers.size(),
-            .ppEnabledLayerNames = enabled_layers.begin(),
+            .enabledLayerCount = std::size(enabled_layers),
+            .ppEnabledLayerNames = enabled_layers,
             .enabledExtensionCount = static_cast<uint32_t>(extensionCount),
             .ppEnabledExtensionNames = extensions.get(),
         };
