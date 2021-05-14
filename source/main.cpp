@@ -930,7 +930,6 @@ int main() {
         auto& frame = frames[frame_index];
 
         vkWaitForFences(device, 1, &frame.ready_fence, VK_TRUE, -1ul);
-        vkResetFences(device, 1, &frame.ready_fence);
 
         // get next image from swapchain
         uint32_t image_index;
@@ -941,6 +940,7 @@ int main() {
             &image_index
         );
         if (result == VK_SUCCESS) {
+            vkResetFences(device, 1, &frame.ready_fence);
             auto& swapchain_frame = display_size.swapchain_frames[image_index];
 
             // submit command buffer
