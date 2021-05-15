@@ -892,7 +892,7 @@ int main() {
     );
 
     // create frame data
-    unsigned frames_in_flight = 1;
+    unsigned frames_in_flight = 2;
     ge1::unique_span<frame> frames(frames_in_flight);
     for (auto i = 0u; i < frames.size(); i++) {
         auto& frame = frames[i];
@@ -927,29 +927,31 @@ int main() {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        auto& frame = frames[frame_index];
-
-        vkWaitForFences(device, 1, &frame.ready_fence, VK_TRUE, -1ul);
+        vkWaitForFences(
+            device, 1, &frames[frame_index].ready_fence, VK_TRUE, -1ul
+        );
 
         // get next image from swapchain
         uint32_t image_index;
         auto result = vkAcquireNextImageKHR(
             device, display_size.swapchain, -1ul,
-            frame.image_available_semaphore,
+            frames[frame_index].image_available_semaphore,
             VK_NULL_HANDLE,
             &image_index
         );
         if (result == VK_SUCCESS) {
-            vkResetFences(device, 1, &frame.ready_fence);
+            vkResetFences(device, 1, &frames[frame_index].ready_fence);
             auto& swapchain_frame = display_size.swapchain_frames[image_index];
 
             // submit command buffer
-            VkSemaphore waitSemaphores[]{frame.image_available_semaphore};
+            VkSemaphore waitSemaphores[]{
+                frames[frame_index].image_available_semaphore
+            };
             VkPipelineStageFlags waitStages[]{
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
             };
             VkSemaphore signalSemaphores[]{
-                frame.render_finished_semaphore
+                frames[frame_index].render_finished_semaphore
             };
             VkSubmitInfo submitInfo{
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -963,7 +965,8 @@ int main() {
             };
             if (
                 vkQueueSubmit(
-                    graphicsQueue, 1, &submitInfo, frame.ready_fence
+                    graphicsQueue, 1, &submitInfo,
+                    frames[frame_index].ready_fence
                 ) != VK_SUCCESS
             ) {
                 throw runtime_error("failed to submit draw command buffer");
@@ -985,6 +988,10 @@ int main() {
         } else if (
             result == VK_SUBOPTIMAL_KHR || result == VK_ERROR_OUT_OF_DATE_KHR
         ) {
+            for (auto frame : frames) {
+                vkWaitForFences(device, 1, &frame.ready_fence, VK_TRUE, -1ul);
+            }
+
             int framebuffer_width, framebuffer_height;
             glfwGetFramebufferSize(
                 window, &framebuffer_width, &framebuffer_height
