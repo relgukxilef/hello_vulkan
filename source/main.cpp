@@ -103,6 +103,8 @@ static VkVertexInputAttributeDescription vertex_attribute_descriptions[]{
     },
 };
 
+VkSampleCountFlagBits max_sample_count;
+
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
@@ -121,13 +123,24 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
 }
 
 struct swapchain_frame {
-    VkImage image;
+    // can't have image_available_semaphore here because calls to
+    // vkAcquireNextImageKHR require a semaphore, but at that point it's not
+    // known which image will be used
     VkImageView view;
+    // TODO: for number of in-flight frames to be independent of number of
+    // swapchain images, there would have to be on framebuffer and command
+    // buffer per combination of swapchain_frame and render frame
     VkFramebuffer framebuffer;
     VkCommandBuffer command_buffer;
+    VkImage color_image;
+    VkImageView color_image_view;
+    VkDeviceMemory memory;
 };
 
-struct frame {
+struct frame_semaphores {
+    // number of swapchain_frames is determined by GPU,
+    // number of in-flight frames is not
+    // there can't be more in-flight frames than swapchain_frames
     VkSemaphore image_available_semaphore, render_finished_semaphore;
     VkFence ready_fence;
 };
@@ -141,6 +154,26 @@ struct display_size {
     VkViewport viewport;
     VkRect2D scissors;
 };
+
+uint32_t get_memory_type_index(
+    VkPhysicalDevice physical_device,
+    uint32_t memory_type_bits, VkMemoryPropertyFlags properties
+) {
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
+
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+        if (
+            (memory_type_bits & (1 << i)) &&
+            (memory_properties.memoryTypes[i].propertyFlags & properties) ==
+            properties
+        ) {
+            return i;
+        }
+    }
+
+    throw std::runtime_error("failed to find suitable memory type");
+}
 
 void create_display_size(
     int framebuffer_width, int framebuffer_height,
@@ -255,14 +288,68 @@ void create_display_size(
         );
         for (auto i = 0u; i < display_size.swapchain_frames.size(); i++) {
             auto& swapchain_frame = display_size.swapchain_frames[i];
-            swapchain_frame.image = images[i];
+            auto image = images[i];
             swapchain_frame.command_buffer = commandBuffers[i];
+
+            VkImageCreateInfo color_image_info{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = surface_format.format,
+                .extent = {
+                    display_size.extent.width, display_size.extent.height, 1
+                },
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = max_sample_count,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage =
+                    VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            };
+
+            if (
+                vkCreateImage(
+                    device, &color_image_info, nullptr,
+                    &swapchain_frame.color_image
+                ) != VK_SUCCESS
+            ) {
+                throw std::runtime_error("failed to create image");
+            }
+
+            VkMemoryRequirements memory_requirements;
+            vkGetImageMemoryRequirements(
+                device, swapchain_frame.color_image, &memory_requirements
+            );
+
+            VkMemoryAllocateInfo allocate_info{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = memory_requirements.size,
+                .memoryTypeIndex = get_memory_type_index(
+                    physical_device,
+                    memory_requirements.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                )
+            };
+
+            if (
+                vkAllocateMemory(
+                    device, &allocate_info, nullptr, &swapchain_frame.memory
+                ) != VK_SUCCESS
+            ) {
+                throw std::runtime_error("failed to allocated memory");
+            }
+
+            vkBindImageMemory(
+                device, swapchain_frame.color_image, swapchain_frame.memory, 0
+            );
 
             // views
             {
                 VkImageViewCreateInfo create_info{
                     .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                    .image = swapchain_frame.image,
+                    .image = image,
                     .viewType = VK_IMAGE_VIEW_TYPE_2D,
                     .format = surface_format.format,
                     .subresourceRange{
@@ -278,13 +365,35 @@ void create_display_size(
                 );
             }
 
+            {
+                VkImageViewCreateInfo create_info{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                    .image = swapchain_frame.color_image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = surface_format.format,
+                    .subresourceRange{
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    }
+                };
+                vkCreateImageView(
+                    device, &create_info, nullptr,
+                    &swapchain_frame.color_image_view
+                );
+            }
+
             // framebuffers
-            VkImageView attachments[] = {swapchain_frame.view};
+            VkImageView attachments[] = {
+                swapchain_frame.color_image_view, swapchain_frame.view
+            };
             {
                 VkFramebufferCreateInfo create_info{
                     .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
                     .renderPass = render_pass,
-                    .attachmentCount = 1,
+                    .attachmentCount = std::size(attachments),
                     .pAttachments = attachments,
                     .width = display_size.extent.width,
                     .height = display_size.extent.height,
@@ -369,6 +478,9 @@ void destroy_display_size(
 
     for (auto& swapchain_frame : display_size.swapchain_frames) {
         vkDestroyImageView(device, swapchain_frame.view, nullptr);
+        vkDestroyImageView(device, swapchain_frame.color_image_view, nullptr);
+        vkDestroyImage(device, swapchain_frame.color_image, nullptr);
+        vkFreeMemory(device, swapchain_frame.memory, nullptr);
     }
 
     vkDestroySwapchainKHR(device, display_size.swapchain, nullptr);
@@ -532,6 +644,33 @@ int main() {
         // TODO: check for VK_KHR_swapchain support
         physical_device = devices[0]; // just pick the first one for now
     }
+
+    // get properties of physical device
+    max_sample_count = VK_SAMPLE_COUNT_1_BIT;
+    {
+        VkPhysicalDeviceProperties physical_device_properties;
+        vkGetPhysicalDeviceProperties(
+            physical_device, &physical_device_properties
+        );
+
+        VkSampleCountFlags sample_count_falgs =
+            physical_device_properties.limits.framebufferColorSampleCounts &
+            physical_device_properties.limits.framebufferDepthSampleCounts &
+            physical_device_properties.limits.framebufferStencilSampleCounts;
+
+        for (auto bit : {
+            VK_SAMPLE_COUNT_64_BIT, VK_SAMPLE_COUNT_32_BIT,
+            VK_SAMPLE_COUNT_16_BIT, VK_SAMPLE_COUNT_8_BIT,
+            VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_2_BIT,
+        }) {
+            if (sample_count_falgs & bit) {
+                max_sample_count = bit;
+                break;
+            }
+        }
+    }
+    assert(max_sample_count != VK_SAMPLE_COUNT_1_BIT);
+    std::cout << max_sample_count << std::endl;
 
     // look for available queue families
     uint32_t queueFamilyCount = 0;
@@ -774,7 +913,7 @@ int main() {
         };
         VkPipelineMultisampleStateCreateInfo multisample_state_create_info{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+            .rasterizationSamples = max_sample_count,
             .sampleShadingEnable = VK_FALSE,
         };
         VkPipelineColorBlendAttachmentState color_blend_attachment_state{
@@ -811,35 +950,58 @@ int main() {
         }
         VkAttachmentDescription color_attachment{
             .format = surfaceFormat.format,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .samples = max_sample_count,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+        VkAttachmentReference color_attachment_reference{
+            .attachment = 0,
+            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+        VkAttachmentDescription resolve_attachment{
+            .format = surfaceFormat.format,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
         };
-        VkAttachmentReference color_attachment_reference{
-            .attachment = 0,
-            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VkAttachmentReference resolve_attachment_reference{
+            .attachment = 1,
+            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
         };
+
         VkSubpassDescription subpass{
             .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
             .colorAttachmentCount = 1,
             .pColorAttachments = &color_attachment_reference,
+            .pResolveAttachments = &resolve_attachment_reference,
         };
         VkSubpassDependency dependency{
             .srcSubpass = VK_SUBPASS_EXTERNAL,
             .dstSubpass = 0,
-            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcStageMask =
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            .dstStageMask =
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
             .srcAccessMask = 0,
             .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
         };
+        VkAttachmentDescription attachments[] = {
+            color_attachment, resolve_attachment
+        };
         VkRenderPassCreateInfo render_pass_create_info{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-            .attachmentCount = 1,
-            .pAttachments = &color_attachment,
+            .attachmentCount = std::size(attachments),
+            .pAttachments = attachments,
             .subpassCount = 1,
             .pSubpasses = &subpass,
             .dependencyCount = 1,
@@ -893,7 +1055,7 @@ int main() {
 
     // create frame data
     unsigned frames_in_flight = 2;
-    ge1::unique_span<frame> frames(frames_in_flight);
+    ge1::unique_span<frame_semaphores> frames(frames_in_flight);
     for (auto i = 0u; i < frames.size(); i++) {
         auto& frame = frames[i];
 
