@@ -26,23 +26,11 @@ extern char _binary_shaders_solid_vertex_glsl_spv_end;
 extern char _binary_shaders_solid_fragment_glsl_spv_start;
 extern char _binary_shaders_solid_fragment_glsl_spv_end;
 
-static float positions[]{
-    -0.5, -0.5,
-    0.5, -0.5,
-    -0.5, 0.5,
-    -0.5, 0.5,
-    0.5, -0.5,
-    0.5, 0.5,
-};
+extern float _binary_models_miku_vertices_vbo_start;
+extern float _binary_models_miku_vertices_vbo_end;
+extern unsigned _binary_models_miku_faces_vbo_start;
+extern unsigned _binary_models_miku_faces_vbo_end;
 
-static float colors[]{
-    0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0,
-    0.0, 0.0, 1.0,
-    0.0, 0.0, 1.0,
-    0.0, 1.0, 0.0,
-    0.0, 1.0, 1.0,
-};
 
 static float matrices[]{
     1, 0, 0, 0,
@@ -51,53 +39,58 @@ static float matrices[]{
     0, 0, 0, 1,
 };
 
-static unsigned vertex_count = 6;
+enum binding : uint32_t {
+    vertices, instances
+};
 
 static VkVertexInputBindingDescription vertex_binding_descriptions[] {
     {
-        .binding = 0,
-        .stride = sizeof(float) * 2,
+        // vertices
+        .binding = vertices,
+        .stride = sizeof(float) * 8,
         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
     }, {
-        .binding = 1,
-        .stride = sizeof(float) * 3,
-        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
-    }, {
-        .binding = 2,
+        // instances
+        .binding = instances,
         .stride = sizeof(float) * 16,
         .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
     },
 };
 
+enum attribute : uint32_t {
+    position, normal,
+    model_0, model_1, model_2, model_3
+};
+
 static VkVertexInputAttributeDescription vertex_attribute_descriptions[]{
     {
-        .location = 0,
-        .binding = 0,
-        .format = VK_FORMAT_R32G32_SFLOAT,
-        .offset = 0,
-    }, {
-        .location = 1,
-        .binding = 1,
+        .location = position,
+        .binding = vertices,
         .format = VK_FORMAT_R32G32B32_SFLOAT,
         .offset = 0,
     }, {
-        .location = 2,
-        .binding = 2,
+        .location = normal,
+        .binding = vertices,
+        .format = VK_FORMAT_R32G32B32_SFLOAT,
+        .offset = sizeof(float) * 3,
+    }, {
+        .location = model_0,
+        .binding = instances,
         .format = VK_FORMAT_R32G32B32A32_SFLOAT,
         .offset = 0,
     }, {
-        .location = 3,
-        .binding = 2,
+        .location = model_1,
+        .binding = instances,
         .format = VK_FORMAT_R32G32B32A32_SFLOAT,
         .offset = sizeof(float) * 4,
     }, {
-        .location = 4,
-        .binding = 2,
+        .location = model_2,
+        .binding = instances,
         .format = VK_FORMAT_R32G32B32A32_SFLOAT,
         .offset = sizeof(float) * 8,
     }, {
-        .location = 5,
-        .binding = 2,
+        .location = model_3,
+        .binding = instances,
         .format = VK_FORMAT_R32G32B32A32_SFLOAT,
         .offset = sizeof(float) * 12,
     },
@@ -128,13 +121,16 @@ struct swapchain_frame {
     // known which image will be used
     VkImageView view;
     // TODO: for number of in-flight frames to be independent of number of
-    // swapchain images, there would have to be on framebuffer and command
+    // swapchain images, there would have to be one framebuffer and command
     // buffer per combination of swapchain_frame and render frame
     VkFramebuffer framebuffer;
     VkCommandBuffer command_buffer;
     VkImage color_image;
     VkImageView color_image_view;
-    VkDeviceMemory memory;
+    VkDeviceMemory color_memory;
+    VkImage depth_image;
+    VkImageView depth_image_view;
+    VkDeviceMemory depth_memory;
 };
 
 struct frame_semaphores {
@@ -143,6 +139,13 @@ struct frame_semaphores {
     // there can't be more in-flight frames than swapchain_frames
     VkSemaphore image_available_semaphore, render_finished_semaphore;
     VkFence ready_fence;
+};
+
+struct scene {
+    VkBuffer static_buffer;
+
+    uint64_t vertex_offset, face_offset, instance_offset;
+    uint32_t index_count;
 };
 
 struct display_size {
@@ -155,33 +158,13 @@ struct display_size {
     VkRect2D scissors;
 };
 
-uint32_t get_memory_type_index(
-    VkPhysicalDevice physical_device,
-    uint32_t memory_type_bits, VkMemoryPropertyFlags properties
-) {
-    VkPhysicalDeviceMemoryProperties memory_properties;
-    vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
-
-    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
-        if (
-            (memory_type_bits & (1 << i)) &&
-            (memory_properties.memoryTypes[i].propertyFlags & properties) ==
-            properties
-        ) {
-            return i;
-        }
-    }
-
-    throw std::runtime_error("failed to find suitable memory type");
-}
-
 void create_display_size(
     int framebuffer_width, int framebuffer_height,
     VkDevice device,
     VkPhysicalDevice physical_device,
     uint32_t graphics_queue_family, uint32_t present_queue_family,
     VkSurfaceKHR surface, VkSurfaceFormatKHR surface_format,
-    VkCommandPool command_pool, VkBuffer vertex_buffer,
+    VkCommandPool command_pool, scene scene,
     VkRenderPass render_pass, VkPipeline pipeline,
     display_size& display_size
 ) {
@@ -323,26 +306,14 @@ void create_display_size(
                 device, swapchain_frame.color_image, &memory_requirements
             );
 
-            VkMemoryAllocateInfo allocate_info{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                .allocationSize = memory_requirements.size,
-                .memoryTypeIndex = get_memory_type_index(
-                    physical_device,
-                    memory_requirements.memoryTypeBits,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-                )
-            };
-
-            if (
-                vkAllocateMemory(
-                    device, &allocate_info, nullptr, &swapchain_frame.memory
-                ) != VK_SUCCESS
-            ) {
-                throw std::runtime_error("failed to allocated memory");
-            }
+            swapchain_frame.color_memory = ge1::allocate_memory(
+                device, physical_device, memory_requirements,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            );
 
             vkBindImageMemory(
-                device, swapchain_frame.color_image, swapchain_frame.memory, 0
+                device, swapchain_frame.color_image,
+                swapchain_frame.color_memory, 0
             );
 
             // views
@@ -411,12 +382,13 @@ void create_display_size(
             }
 
             // write commands
+            auto& command_buffer = swapchain_frame.command_buffer;
             VkCommandBufferBeginInfo buffer_begin_info{
                 .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             };
             if (
                 vkBeginCommandBuffer(
-                    swapchain_frame.command_buffer, &buffer_begin_info
+                    command_buffer, &buffer_begin_info
                 ) != VK_SUCCESS
             ) {
                 throw runtime_error("failed to begin recording command buffer");
@@ -434,33 +406,39 @@ void create_display_size(
                 .pClearValues = &clearValue,
             };
             vkCmdBeginRenderPass(
-                swapchain_frame.command_buffer, &render_pass_begin_info,
+                command_buffer, &render_pass_begin_info,
                 VK_SUBPASS_CONTENTS_INLINE
             );
 
             vkCmdBindPipeline(
-                swapchain_frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 pipeline
             );
 
-            vkCmdSetViewport(commandBuffers[i], 0, 1, &display_size.viewport);
-            vkCmdSetScissor(commandBuffers[i], 0, 1, &display_size.scissors);
+            vkCmdSetViewport(command_buffer, 0, 1, &display_size.viewport);
+            vkCmdSetScissor(command_buffer, 0, 1, &display_size.scissors);
             VkBuffer vertex_buffers[] = {
-                vertex_buffer, vertex_buffer, vertex_buffer,
+                scene.static_buffer, scene.static_buffer,
             };
             VkDeviceSize offsets[] = {
-                0, sizeof(positions), sizeof(positions) + sizeof(colors)
+                scene.vertex_offset, scene.instance_offset
             };
             vkCmdBindVertexBuffers(
-                commandBuffers[i], 0,
+                command_buffer, 0,
                 size(vertex_buffers), vertex_buffers, offsets
             );
+            vkCmdBindIndexBuffer(
+                command_buffer, scene.static_buffer, scene.face_offset,
+                VK_INDEX_TYPE_UINT32
+            );
 
-            vkCmdDraw(swapchain_frame.command_buffer, vertex_count, 1, 0, 0);
-            vkCmdEndRenderPass(swapchain_frame.command_buffer);
+            vkCmdDrawIndexed(
+                command_buffer, scene.index_count, 1, 0, 0, 0
+            );
+            vkCmdEndRenderPass(command_buffer);
 
             if (
-                vkEndCommandBuffer(swapchain_frame.command_buffer) != VK_SUCCESS
+                vkEndCommandBuffer(command_buffer) != VK_SUCCESS
             ) {
                 throw runtime_error("failed to record command buffer");
             }
@@ -480,7 +458,7 @@ void destroy_display_size(
         vkDestroyImageView(device, swapchain_frame.view, nullptr);
         vkDestroyImageView(device, swapchain_frame.color_image_view, nullptr);
         vkDestroyImage(device, swapchain_frame.color_image, nullptr);
-        vkFreeMemory(device, swapchain_frame.memory, nullptr);
+        vkFreeMemory(device, swapchain_frame.color_memory, nullptr);
     }
 
     vkDestroySwapchainKHR(device, display_size.swapchain, nullptr);
@@ -814,7 +792,7 @@ int main() {
             30.f, windowWidth, windowHeight, 0.1, 100
         );
         matrix = matrix * glm::lookAt(
-            glm::vec3{0, -1, 1}, {0, 0, 0}, {0, 1, 0}
+            glm::vec3{0, -1, 1}, {0, 0, 1}, {0, 0, 1}
         );
         copy(
             glm::value_ptr(matrix), glm::value_ptr(matrix) + 16,
@@ -823,14 +801,23 @@ int main() {
     }
 
     // create buffers for geometry
+    scene scene;
     auto vertex_buffer_size =
-        sizeof(positions) + sizeof(colors) + sizeof(matrices);
+        sizeof(float) * (
+            &_binary_models_miku_vertices_vbo_end -
+            &_binary_models_miku_vertices_vbo_start
+        ) + sizeof(unsigned) * (
+            &_binary_models_miku_faces_vbo_end -
+            &_binary_models_miku_faces_vbo_start
+        ) + sizeof(matrices);
     VkBuffer vertex_buffer;
     {
         VkBufferCreateInfo create_info{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = vertex_buffer_size,
-            .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            .usage =
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         };
         if (
@@ -851,14 +838,27 @@ int main() {
     {
         void* data;
         vkMapMemory(device, vertex_memory, 0, vertex_buffer_size, 0, &data);
-        memcpy(data, positions, sizeof(positions));
-        memcpy((char*)data + sizeof(positions), colors, sizeof(colors));
+        void* iterator = data;
+        scene.vertex_offset = 0;
+        iterator = std::copy(
+            &_binary_models_miku_vertices_vbo_start,
+            &_binary_models_miku_vertices_vbo_end, (float*)iterator
+        );
+        scene.face_offset = (char*)iterator - (char*)data;
+        iterator = std::copy(
+            &_binary_models_miku_faces_vbo_start,
+            &_binary_models_miku_faces_vbo_end, (unsigned*)iterator
+        );
+        scene.instance_offset = (char*)iterator - (char*)data;
         memcpy(
-            (char*)data + sizeof(positions) + sizeof(colors),
+            (char*)iterator,
             matrices, sizeof(matrices)
         );
         vkUnmapMemory(device, vertex_memory);
     }
+    scene.static_buffer = vertex_buffer;
+    scene.index_count =
+        &_binary_models_miku_faces_vbo_end - &_binary_models_miku_faces_vbo_start;
 
     // create pipeline
     VkRenderPass render_pass;
@@ -1049,7 +1049,7 @@ int main() {
     create_display_size(
         framebuffer_width, framebuffer_width, device, physical_device,
         graphicsQueueFamily, presentQueueFamily, surface, surfaceFormat,
-        commandPool, vertex_buffer, render_pass, pipeline,
+        commandPool, scene, render_pass, pipeline,
         display_size
     );
 
@@ -1166,7 +1166,7 @@ int main() {
                     device, physical_device,
                     graphicsQueueFamily, presentQueueFamily,
                     surface, surfaceFormat,
-                    commandPool, vertex_buffer, render_pass, pipeline,
+                    commandPool, scene, render_pass, pipeline,
                     display_size
                 );
             }

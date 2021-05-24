@@ -39,5 +39,32 @@ function(add_shader TARGET SHADER)
     )
 endfunction(add_shader)
 
+function(add_binary TARGET FILE)
+    set(input ${CMAKE_CURRENT_SOURCE_DIR}/${FILE})
+    set(output ${CMAKE_BINARY_DIR}/${FILE}.o)
+
+    get_filename_component(output-dir ${output} DIRECTORY)
+    file(MAKE_DIRECTORY ${output-dir})
+
+    add_custom_command(
+        OUTPUT ${output}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMAND ld -r -b binary -o ${output} ${FILE}
+        DEPENDS ${input}
+        VERBATIM
+    )
+
+    # Make sure our build depends on this output.
+    set_source_files_properties(
+        ${output} PROPERTIES GENERATED TRUE
+    )
+    target_sources(
+        ${TARGET} PRIVATE ${output} ${input}
+    )
+endfunction(add_binary)
+
 add_shader(vulkan shaders/solid_vertex.glsl)
 add_shader(vulkan shaders/solid_fragment.glsl)
+
+add_binary(vulkan models/miku_vertices.vbo)
+add_binary(vulkan models/miku_faces.vbo)
